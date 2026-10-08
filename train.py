@@ -1,0 +1,242 @@
+"""
+Train the GPT on the encoded Tiny Shakespeare.
+
+    python train.py                         # default config (~10.7M params)
+    python train.py --n_layer 4 --max_iters 2000   # any TrainConfig field can be overridden
+
+Every eval_interval steps it reports train/val loss, prints a short sample so
+you can watch the model learn to write, and saves the best checkpoint to
+out/ckpt.pt.
+"""
+
+import argparse
+import csv
+import math
+import time
+from dataclasses import asdict, dataclass, fields
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from model import GPT, GPTConfig
+from tokenizer import CharTokenizer
+
+DATA_DIR = Path(__file__).parent / "data"
+
+
+@dataclass
+class TrainConfig:
+    # Model shape (see GPTConfig)
+    block_size: int = 256
+    n_layer: int = 6
+    n_head: int = 6
+    n_embd: int = 384
+    dropout: float = 0.2
+
+    # Optimization
+    batch_size: int = 64  # sequences per step -> 64 * 256 = 16k tokens per step
+    max_iters: int = 5000
+    learning_rate: float = 1e-3  # peak LR, reached after warmup
+    min_lr: float = 1e-4  # LR at the end of the cosine decay
+    warmup_iters: int = 100
+    weight_decay: float = 0.1
+    grad_clip: float = 1.0
+
+    # Evaluation and logging
+    eval_interval: int = 250
+    eval_iters: int = 200  # batches averaged per loss estimate
+    log_interval: int = 50
+    sample_tokens: int = 200  # length of the sample printed at each eval
+
+    # System
+    out_dir: str = "out"
+    seed: int = 1337
+    compile: bool = False  # torch.compile; needs Triton (pip install triton-windows on Windows)
+
+
+def parse_args():
+    """Expose every TrainConfig field as a --flag with the same name."""
+    parser = argparse.ArgumentParser()
+    for f in fields(TrainConfig):
+        if f.type is bool:
+            parser.add_argument(f"--{f.name}", type=lambda s: s.lower() in ("1", "true", "yes"), default=f.default)
+        else:
+            parser.add_argument(f"--{f.name}", type=f.type, default=f.default)
+    return TrainConfig(**vars(parser.parse_args()))
+
+
+def load_split(name, device):
+    # The whole corpus is ~1M tokens (8 MB as int64), so it fits on the GPU
+    # and batches can be sliced there directly. For a dataset of many GB you
+    # would keep it on disk with np.memmap and copy each batch over instead.
+    data = np.fromfile(DATA_DIR / f"{name}.bin", dtype=np.uint16)
+    return torch.from_numpy(data.astype(np.int64)).to(device)
+
+
+def get_batch(data, batch_size, block_size):
+    """
+    Pick batch_size random windows of block_size+1 tokens. The input is the
+    window minus its last token, the target is the window shifted by one:
+
+        text:    T  o     b  e
+        x:       T  o     b
+        y:          o     b  e      (y[t] is the token that follows x[..t])
+    """
+    starts = torch.randint(len(data) - block_size, (batch_size,), device=data.device)
+    offsets = torch.arange(block_size + 1, device=data.device)
+    windows = data[starts[:, None] + offsets]  # (B, block_size + 1)
+    return windows[:, :-1], windows[:, 1:]
+
+
+def get_lr(it, cfg):
+    """Linear warmup, then cosine decay from learning_rate down to min_lr."""
+    if it < cfg.warmup_iters:
+        return cfg.learning_rate * (it + 1) / cfg.warmup_iters
+    progress = (it - cfg.warmup_iters) / max(1, cfg.max_iters - cfg.warmup_iters)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))  # 1 -> 0
+    return cfg.min_lr + coeff * (cfg.learning_rate - cfg.min_lr)
+
+
+def make_optimizer(model, cfg):
+    # Weight decay pulls weights towards zero to limit overfitting. It is
+    # applied to matrices (linear layers, embeddings) but not to 1-D
+    # parameters like LayerNorm gains and biases, where it only hurts.
+    decay = [p for p in model.parameters() if p.dim() >= 2]
+    no_decay = [p for p in model.parameters() if p.dim() < 2]
+    groups = [
+        {"params": decay, "weight_decay": cfg.weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+    return torch.optim.AdamW(groups, lr=cfg.learning_rate, betas=(0.9, 0.99), fused=True)
+
+
+@torch.no_grad()
+def estimate_loss(model, splits, cfg):
+    """Average the loss over many batches: a single batch is too noisy."""
+    model.eval()  # disables dropout
+    out = {}
+    for name, data in splits.items():
+        losses = torch.zeros(cfg.eval_iters)
+        for k in range(cfg.eval_iters):
+            x, y = get_batch(data, cfg.batch_size, cfg.block_size)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                _, loss = model(x, y)
+            losses[k] = loss.item()
+        out[name] = losses.mean().item()
+    model.train()
+    return out
+
+
+@torch.no_grad()
+def sample_text(model, tok, n_tokens):
+    model.eval()
+    start = torch.tensor([tok.encode("\n")], device="cuda")
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        new = torch.cat(list(model.generate(start, n_tokens, temperature=0.8, top_k=40)), dim=1)
+    model.train()
+    return tok.decode(new[0].tolist())
+
+
+def main():
+    cfg = parse_args()
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA not available: check that the CUDA build of PyTorch is installed.")
+
+    torch.manual_seed(cfg.seed)
+    # Let float32 matmuls use TF32 tensor cores (much faster on RTX 30/40).
+    torch.set_float32_matmul_precision("high")
+
+    out_dir = Path(cfg.out_dir)
+    out_dir.mkdir(exist_ok=True)
+
+    tok = CharTokenizer.from_meta()
+    splits = {"train": load_split("train", "cuda"), "val": load_split("val", "cuda")}
+
+    model_cfg = GPTConfig(
+        vocab_size=tok.vocab_size,
+        block_size=cfg.block_size,
+        n_layer=cfg.n_layer,
+        n_head=cfg.n_head,
+        n_embd=cfg.n_embd,
+        dropout=cfg.dropout,
+    )
+    model = GPT(model_cfg).cuda()
+    print(f"Model: {model.num_params() / 1e6:.2f}M parameters")
+    print(f"Untrained loss should be about ln({tok.vocab_size}) = {math.log(tok.vocab_size):.2f}")
+
+    optimizer = make_optimizer(model, cfg)
+
+    # Keep a handle on the plain module: torch.compile wraps it, and we want
+    # to save clean state_dict keys.
+    raw_model = model
+    if cfg.compile:
+        model = torch.compile(model)
+
+    metrics_path = out_dir / "metrics.csv"
+    with open(metrics_path, "w", newline="") as f:
+        csv.writer(f).writerow(["iter", "train_loss", "val_loss"])
+
+    best_val = float("inf")
+    tokens_per_step = cfg.batch_size * cfg.block_size
+    t0, steps_timed = time.perf_counter(), 0
+
+    for it in range(cfg.max_iters + 1):
+        lr = get_lr(it, cfg)
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+
+        if it % cfg.eval_interval == 0 or it == cfg.max_iters:
+            losses = estimate_loss(model, splits, cfg)
+            print(f"\n=== step {it}: train loss {losses['train']:.4f} | val loss {losses['val']:.4f}")
+            with open(metrics_path, "a", newline="") as f:
+                csv.writer(f).writerow([it, f"{losses['train']:.4f}", f"{losses['val']:.4f}"])
+
+            # Only keep the checkpoint that generalizes best. When train loss
+            # keeps falling but val loss rises, the model is memorizing.
+            if losses["val"] < best_val:
+                best_val = losses["val"]
+                torch.save(
+                    {
+                        "model": raw_model.state_dict(),
+                        "model_config": asdict(model_cfg),
+                        "train_config": asdict(cfg),
+                        "chars": tok.chars,
+                        "iter": it,
+                        "val_loss": best_val,
+                    },
+                    out_dir / "ckpt.pt",
+                )
+                print(f"    saved checkpoint (best val loss so far)")
+
+            print("--- sample ---" + sample_text(raw_model, tok, cfg.sample_tokens) + "\n--------------")
+            t0, steps_timed = time.perf_counter(), 0  # don't count eval time in the step timing
+
+        if it == cfg.max_iters:
+            break
+
+        # One optimization step: forward, backward, update.
+        x, y = get_batch(splits["train"], cfg.batch_size, cfg.block_size)
+        # bfloat16 autocast: matmuls run in 16-bit on the tensor cores, with
+        # the same exponent range as float32 so no loss scaling is needed.
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            _, loss = model(x, y)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        # Rescale the gradient if its norm is too large: protects against the
+        # occasional huge update that can derail training.
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        optimizer.step()
+
+        steps_timed += 1
+        if (it + 1) % cfg.log_interval == 0:
+            loss_val = loss.item()  # .item() waits for the GPU, so timing is accurate
+            dt = (time.perf_counter() - t0) / steps_timed
+            print(f"step {it + 1:5d} | loss {loss_val:.4f} | lr {lr:.2e} | {dt * 1000:.1f} ms/step | {tokens_per_step / dt / 1e3:.0f}k tok/s")
+            t0, steps_timed = time.perf_counter(), 0
+
+    print(f"\nDone. Best val loss {best_val:.4f}, checkpoint in {out_dir / 'ckpt.pt'}")
+
+
+if __name__ == "__main__":
+    main()

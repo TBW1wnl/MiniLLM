@@ -1,0 +1,4 @@
+# Install the CUDA build of PyTorch first:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+torch
+numpy
