@@ -40,6 +40,19 @@ Any training setting can be overridden from the command line, e.g. `python train
 
 `out/metrics.csv` logs train/val loss at every evaluation. Note that the loss printed every 50 steps is higher than the "train loss" at evaluations: the former is measured with dropout on, the latter with dropout off.
 
+## Mixture of Experts
+
+```bash
+python train.py --n_experts 8 --experts_per_token 2 --out_dir out_moe
+python sample.py --checkpoint out_moe/ckpt.pt
+```
+
+With `--n_experts N`, the MLP of every block becomes a `MoE` layer (see `model.py`): N independent MLPs plus a router that sends each token to its `experts_per_token` best experts and mixes their outputs. With 8 experts and 2 active, the model holds 60.2M parameters but each token only uses 17.75M, so compute grows much less than size.
+
+A load-balancing loss (`--aux_loss_coef`, Switch Transformer style) stops the router from sending everything to a few experts. Training prints its value (`aux`, 1.0 = perfectly balanced) and, at each eval, the share of tokens each expert receives per layer.
+
+On Tiny Shakespeare this mostly shows how routing works, not why MoE helps: the dense model already overfits 1M characters, and 6x more parameters only memorize them faster. MoE pays off when data is not the bottleneck.
+
 ## Ideas to explore
 
 - **Size**: change `n_layer`, `n_embd`, `block_size` and watch speed and val loss.

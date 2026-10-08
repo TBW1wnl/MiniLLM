@@ -34,6 +34,11 @@ class TrainConfig:
     n_embd: int = 384
     dropout: float = 0.2
 
+    # Mixture of Experts (n_experts = 0 trains the plain dense model)
+    n_experts: int = 0
+    experts_per_token: int = 2
+    aux_loss_coef: float = 0.01  # weight of the load-balancing loss
+
     # Optimization
     batch_size: int = 64  # sequences per step -> 64 * 256 = 16k tokens per step
     max_iters: int = 5000
@@ -121,11 +126,21 @@ def estimate_loss(model, splits, cfg):
         for k in range(cfg.eval_iters):
             x, y = get_batch(data, cfg.batch_size, cfg.block_size)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                _, loss = model(x, y)
+                _, loss, _ = model(x, y)
             losses[k] = loss.item()
         out[name] = losses.mean().item()
     model.train()
     return out
+
+
+def format_expert_load(model):
+    """One line per block: share of routing slots each expert received in the
+    last forward pass. Perfect balance is 100% / n_experts for every expert."""
+    lines = []
+    for i, block in enumerate(model.blocks):
+        load = block.mlp.last_load.tolist()
+        lines.append(f"    layer {i}: " + " ".join(f"{p:5.1%}" for p in load))
+    return "\n".join(lines)
 
 
 @torch.no_grad()
@@ -160,9 +175,16 @@ def main():
         n_head=cfg.n_head,
         n_embd=cfg.n_embd,
         dropout=cfg.dropout,
+        n_experts=cfg.n_experts,
+        experts_per_token=cfg.experts_per_token,
     )
+    use_moe = cfg.n_experts > 0
     model = GPT(model_cfg).cuda()
-    print(f"Model: {model.num_params() / 1e6:.2f}M parameters")
+    print(f"Model: {model.num_params() / 1e6:.2f}M parameters", end="")
+    if use_moe:
+        print(f", {model.num_active_params() / 1e6:.2f}M active per token "
+              f"({cfg.n_experts} experts, {cfg.experts_per_token} per token)", end="")
+    print()
     print(f"Untrained loss should be about ln({tok.vocab_size}) = {math.log(tok.vocab_size):.2f}")
 
     optimizer = make_optimizer(model, cfg)
@@ -189,6 +211,9 @@ def main():
         if it % cfg.eval_interval == 0 or it == cfg.max_iters:
             losses = estimate_loss(model, splits, cfg)
             print(f"\n=== step {it}: train loss {losses['train']:.4f} | val loss {losses['val']:.4f}")
+            if use_moe:
+                # last_load comes from the last val batch of estimate_loss.
+                print("    expert load (share of tokens per expert):\n" + format_expert_load(raw_model))
             with open(metrics_path, "a", newline="") as f:
                 csv.writer(f).writerow([it, f"{losses['train']:.4f}", f"{losses['val']:.4f}"])
 
@@ -220,9 +245,11 @@ def main():
         # bfloat16 autocast: matmuls run in 16-bit on the tensor cores, with
         # the same exponent range as float32 so no loss scaling is needed.
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            _, loss = model(x, y)
+            _, loss, aux_loss = model(x, y)
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        # The aux loss only matters for MoE (it is 0 for a dense model). Its
+        # small weight keeps it from competing with the real objective.
+        (loss + cfg.aux_loss_coef * aux_loss).backward()
         # Rescale the gradient if its norm is too large: protects against the
         # occasional huge update that can derail training.
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -232,7 +259,8 @@ def main():
         if (it + 1) % cfg.log_interval == 0:
             loss_val = loss.item()  # .item() waits for the GPU, so timing is accurate
             dt = (time.perf_counter() - t0) / steps_timed
-            print(f"step {it + 1:5d} | loss {loss_val:.4f} | lr {lr:.2e} | {dt * 1000:.1f} ms/step | {tokens_per_step / dt / 1e3:.0f}k tok/s")
+            aux_str = f" | aux {aux_loss.item():.3f}" if use_moe else ""
+            print(f"step {it + 1:5d} | loss {loss_val:.4f}{aux_str} | lr {lr:.2e} | {dt * 1000:.1f} ms/step | {tokens_per_step / dt / 1e3:.0f}k tok/s")
             t0, steps_timed = time.perf_counter(), 0
 
     print(f"\nDone. Best val loss {best_val:.4f}, checkpoint in {out_dir / 'ckpt.pt'}")
